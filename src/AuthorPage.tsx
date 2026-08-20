@@ -126,6 +126,19 @@ export default function AuthorPage() {
         </div>
       )}
 
+      {result?.failedPapers?.length && !progress ? (
+        <div className="mt-6 rounded-xl bg-amber-50 p-4 text-sm text-amber-900">
+          <p>
+            Rate limits cut off {result.failedPapers.length} paper
+            {result.failedPapers.length === 1 ? "" : "s"} — citations of{" "}
+            {result.failedPapers.map((t) => `“${t}”`).join(", ")} are missing.
+          </p>
+          <button className="mt-2 underline" onClick={load}>
+            Refresh to fill them in
+          </button>
+        </div>
+      ) : null}
+
       {error && (
         <div className="mt-6 rounded-xl bg-red-50 p-4 text-sm text-red-800">
           <p>{error}</p>

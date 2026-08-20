@@ -5,6 +5,8 @@ export type CachedResult = {
   author: Author;
   papers: Paper[];
   citations: Citation[];
+  /** Titles whose citations couldn't be fetched — the list below them is incomplete. */
+  failedPapers?: string[];
 };
 
 const key = (authorId: string) => `s2-citations:${authorId}`;

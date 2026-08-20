@@ -47,10 +47,40 @@ export class ApiError extends Error {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const RATE_LIMIT_HELP =
+  "Semantic Scholar is rate-limiting us (their anonymous pool is shared with the whole internet). Wait a minute and try again, or add an API key below.";
+
+/**
+ * Minimum spacing between requests. Semantic Scholar allows roughly one
+ * unauthenticated request per second across all anonymous callers, so we pace
+ * ourselves rather than sprinting into a wall of 429s.
+ */
+const MIN_GAP_MS = { anon: 1200, keyed: 120 };
+
+let nextSlot = 0;
+
+/** Serializes requests globally so React Strict Mode's double-mount can't double the rate either. */
+async function waitForSlot(apiKey: string | undefined, signal?: AbortSignal) {
+  const gap = apiKey ? MIN_GAP_MS.keyed : MIN_GAP_MS.anon;
+  const now = Date.now();
+  const at = Math.max(now, nextSlot);
+  nextSlot = at + gap;
+  if (at > now) await sleep(at - now);
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+}
+
+const isAbort = (err: unknown) =>
+  err instanceof DOMException && err.name === "AbortError";
+
 /**
  * Semantic Scholar's unauthenticated pool is small and shared with every other
  * anonymous caller, so 429s are routine rather than exceptional. Back off and
  * keep trying; the caller reports progress while we wait.
+ *
+ * Their 429 responses carry no CORS headers, so the browser blocks them and
+ * fetch rejects with an opaque TypeError instead of handing us a status code.
+ * That means any network-level failure has to be treated as a probable rate
+ * limit and retried — we can't tell the difference from here.
  */
 async function apiGet<T>(
   path: string,
@@ -67,24 +97,40 @@ async function apiGet<T>(
   const headers: Record<string, string> = {};
   if (apiKey) headers["x-api-key"] = apiKey;
 
-  let waitMs = 1500;
+  const MAX_ATTEMPTS = 8;
+  let waitMs = 2000;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(API + path, { headers, signal });
+    const lastAttempt = attempt >= MAX_ATTEMPTS - 1;
+    await waitForSlot(apiKey, signal);
+
+    let res: Response;
+    try {
+      res = await fetch(API + path, { headers, signal });
+    } catch (err) {
+      if (isAbort(err)) throw err;
+      // Opaque failure: almost always a CORS-stripped 429, occasionally offline.
+      if (lastAttempt) throw new ApiError(RATE_LIMIT_HELP, 429);
+      onRetry?.(waitMs);
+      await sleep(waitMs);
+      waitMs = Math.min(waitMs * 2, 30000);
+      continue;
+    }
+
     if (res.ok) return (await res.json()) as T;
 
     const retryable = res.status === 429 || res.status >= 500;
-    if (!retryable || attempt >= 5) {
+    if (!retryable || lastAttempt) {
       const body = await res.text().catch(() => "");
       throw new ApiError(
         res.status === 429
-          ? "Semantic Scholar is rate-limiting us. Wait a minute and try again, or add an API key."
+          ? RATE_LIMIT_HELP
           : `Semantic Scholar returned ${res.status}. ${body.slice(0, 200)}`,
         res.status,
       );
     }
     onRetry?.(waitMs);
     await sleep(waitMs);
-    waitMs = Math.min(waitMs * 2, 20000);
+    waitMs = Math.min(waitMs * 2, 30000);
   }
 }
 
@@ -114,7 +160,11 @@ export async function searchAuthors(
 
 export async function getAuthor(
   authorId: string,
-  opts: { apiKey?: string; signal?: AbortSignal } = {},
+  opts: {
+    apiKey?: string;
+    signal?: AbortSignal;
+    onRetry?: (waitMs: number) => void;
+  } = {},
 ) {
   return apiGet<Author>(
     `/author/${authorId}?fields=name,affiliations,paperCount,citationCount,homepage`,
@@ -127,7 +177,11 @@ const PAPER_FIELDS =
 
 export async function getAuthorPapers(
   authorId: string,
-  opts: { apiKey?: string; signal?: AbortSignal } = {},
+  opts: {
+    apiKey?: string;
+    signal?: AbortSignal;
+    onRetry?: (waitMs: number) => void;
+  } = {},
 ) {
   const papers: Paper[] = [];
   let offset = 0;
@@ -192,19 +246,40 @@ export async function fetchAllCitations(
     signal?: AbortSignal;
     onProgress?: (p: Progress) => void;
   } = {},
-): Promise<{ author: Author; papers: Paper[]; citations: Citation[] }> {
+): Promise<{
+  author: Author;
+  papers: Paper[];
+  citations: Citation[];
+  failedPapers: string[];
+}> {
+  const retryLabel = (waitMs: number, done: number, total: number) =>
+    onProgress?.({
+      done,
+      total,
+      label: `Rate-limited; retrying in ${Math.round(waitMs / 1000)}s…`,
+    });
+
   onProgress?.({ done: 0, total: 1, label: "Looking up author…" });
-  const author = await getAuthor(authorId, { apiKey, signal });
+  const author = await getAuthor(authorId, {
+    apiKey,
+    signal,
+    onRetry: (ms) => retryLabel(ms, 0, 1),
+  });
 
   onProgress?.({
     done: 0,
     total: 1,
     label: `Loading papers by ${author.name}…`,
   });
-  const papers = await getAuthorPapers(authorId, { apiKey, signal });
+  const papers = await getAuthorPapers(authorId, {
+    apiKey,
+    signal,
+    onRetry: (ms) => retryLabel(ms, 0, 1),
+  });
 
   const byCiting = new Map<string, Citation>();
   const cited = papers.filter((p) => (p.citationCount ?? 0) > 0);
+  const failedPapers: string[] = [];
   let done = 0;
 
   for (const paper of cited) {
@@ -213,16 +288,21 @@ export async function fetchAllCitations(
       total: cited.length,
       label: `Citations of “${paper.title}”`,
     });
-    const edges = await getCitations(paper.paperId, {
-      apiKey,
-      signal,
-      onRetry: (waitMs) =>
-        onProgress?.({
-          done,
-          total: cited.length,
-          label: `Rate-limited; retrying in ${Math.round(waitMs / 1000)}s…`,
-        }),
-    });
+    // One paper losing its fight with the rate limiter shouldn't discard the
+    // citations already gathered for every other paper.
+    let edges: CitationEdge[];
+    try {
+      edges = await getCitations(paper.paperId, {
+        apiKey,
+        signal,
+        onRetry: (ms) => retryLabel(ms, done, cited.length),
+      });
+    } catch (err) {
+      if (isAbort(err)) throw err;
+      failedPapers.push(paper.title);
+      done++;
+      continue;
+    }
     for (const edge of edges) {
       const citing = edge.citingPaper;
       if (!citing?.paperId) continue;
@@ -250,7 +330,7 @@ export async function fetchAllCitations(
   const citations = [...byCiting.values()].sort((a, b) =>
     sortKey(b.citingPaper).localeCompare(sortKey(a.citingPaper)),
   );
-  return { author, papers, citations };
+  return { author, papers, citations, failedPapers };
 }
 
 /** Undated papers sort to the bottom of their year. */
