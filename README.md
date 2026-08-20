@@ -1,32 +1,23 @@
-# React + TypeScript + Vite
+# Latest Citations
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A reverse-chronological "who just cited me?" view for any [Semantic Scholar](https://www.semanticscholar.org) author.
 
-Currently, two official plugins are available:
+Enter a name, an author ID, or a profile URL. The app fetches every paper by that author, then every
+citation of each of those papers, merges them into one list, and sorts newest-first by publication date.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Runs entirely in the browser — no server, no backend.
+- Results are cached in `localStorage`; the header shows how stale they are and offers a refresh.
+- An optional Semantic Scholar API key (stored only in your browser) raises the rate limit; without one
+  the app shares the anonymous pool and backs off on 429s.
+- Self-citations are excluded. Papers citing more than one of the author's works appear once, tagged
+  with each work they cite.
 
-## React Compiler
+## Develop
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```sh
+npm install
+npm run dev
+npm run typecheck
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Pushes to `main` build and deploy to GitHub Pages (see `.github/workflows/deploy.yml`).
